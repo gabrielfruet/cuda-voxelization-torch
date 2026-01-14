@@ -1,7 +1,7 @@
 [project]
 name = "cuda-voxelization-torch"
 version = "0.1.0"
-description = "Add your description here"
+description = "CUDA voxelization extension for PyTorch with a simple VisPy viewer"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
