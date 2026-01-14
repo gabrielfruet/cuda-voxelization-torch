@@ -1,0 +1,20 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+compile_commands.json
+
+# Pytorch build artifacts
+*.so
+*.dylib
+*.dll
+*.pyd
+build/
+dist/
+.cache/

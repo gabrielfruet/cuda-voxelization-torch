@@ -1,0 +1,13 @@
+[project]
+name = "cuda-voxelization-torch"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "matplotlib>=3.10.8",
+    "numpy>=2.2.6",
+    "setuptools>=80.9.0",
+    "torch>=2.9.1",
+    "vispy>=0.16.1",
+]
