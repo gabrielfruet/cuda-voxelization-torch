@@ -126,6 +126,13 @@ __global__ void flatten_index_kernel(const int *coors, int *flat_indices,
     dim3 blocks(col_blocks);
     dim3 threads(threadsPerBlock);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    float time;
+    cudaEvent_t start, stop;
+
+    AT_CUDA_CHECK(cudaEventCreate(&start));
+    AT_CUDA_CHECK(cudaEventCreate(&stop));
+    AT_CUDA_CHECK(cudaEventRecord(start, stream));
+
 
     AT_DISPATCH_ALL_TYPES(points.scalar_type(), "dynamic_voxelize_kernel", [&] {
       dynamic_voxelize_kernel<scalar_t, int><<<blocks, threads, 0, stream>>>(
@@ -180,6 +187,11 @@ __global__ void flatten_index_kernel(const int *coors, int *flat_indices,
 
     AT_CUDA_CHECK(cudaGetLastError());
 
+    AT_CUDA_CHECK(cudaEventRecord(stop, 0));
+    AT_CUDA_CHECK(cudaEventSynchronize(stop));
+    AT_CUDA_CHECK(cudaEventElapsedTime(&time, start, stop));
+
+    printf("Time to generate:  %3.1f ms \n", time);
 
     // identify the starts
 

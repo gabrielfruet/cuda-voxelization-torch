@@ -29,7 +29,7 @@ def dynamic_voxelize_gpu(
     points: Tensor,
     voxel_size: List[float],
     coors_range: List[float],
-) -> tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, int]:
     """
     Args:
         points: (N, 3) float tensor of points
@@ -53,10 +53,12 @@ def dynamic_voxelize_gpu(
         points, voxel_coors, point_voxel_idx, voxel_size, coors_range, 3
     )
 
+    num_unique_voxels = int(point_voxel_idx.max().item() + 1)
+
     # inverse coors since its zyx
     voxel_coors = voxel_coors[:, [2, 1, 0]]
 
-    return voxel_coors, point_voxel_idx
+    return voxel_coors, point_voxel_idx, num_unique_voxels
 
 
 if __name__ == "__main__":

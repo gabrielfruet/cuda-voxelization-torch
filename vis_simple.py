@@ -1,261 +1,251 @@
+import argparse
 import sys
+from pathlib import Path
 
 import numpy as np
 import torch
 from vispy import app, scene
-from vispy.visuals.transforms import STTransform
+from vispy.scene import events as scene_events
+from vispy.scene import visuals
 
 from voxelization.ops import dynamic_voxelize_gpu
 
 # NOTE: Do not name this file vispy.py, as it conflicts with the library name.
 
 
-def main():
-    # 1. Load Point Cloud
-    file_path = "000000.bin"
-    try:
-        # KITTI format: x, y, z, intensity (float32)
-        print(f"Loading {file_path}...")
-        raw_data = np.fromfile(file_path, dtype=np.float32).reshape(-1, 4)
-        points = raw_data[:, :3]  # xyz
-        intensities = raw_data[:, 3]  # Intensity
-        print(f"Loaded {len(points)} points.")
-    except FileNotFoundError:
-        print(f"Error: {file_path} not found.")
-        sys.exit(1)
+# Work around a vispy bug where SceneMouseEvent.__repr__ may call .scale on
+# mouse_move events (which don't have it), leading to a TypeError that breaks
+# interaction. Provide a safe default scale value instead.
+def _safe_scale(self):
+    return getattr(self.mouse_event, "scale", 1.0)
 
-    # 2. Setup Vispy Canvas
-    canvas = scene.SceneCanvas(
-        keys="interactive", show=True, title="Simple Point Cloud Visualization"
-    )
-    view = canvas.central_widget.add_view()
-    view.camera = "turntable"  # Options: 'turntable', 'fly', 'arcball'
 
-    # 3. Create Scatter Plot Visual
-    # Color points based on Z-height (simple coloring)
-    z = points[:, 2]
-    # Simple normalization for color: Map [-3, 3] meters to [0, 1]
-    z_min, z_max = -5.0, 3.0
-    z_norm = np.clip((z - z_min) / (z_max - z_min), 0, 1)
+scene_events.SceneMouseEvent.scale = property(_safe_scale)  # type: ignore[attr-defined]
 
-    # White-ish color varying with height
-    colors = np.ones((len(points), 4), dtype=np.float32)
-    colors[:, 0] = z_norm  # Red channel
-    colors[:, 1] = z_norm * 0.5  # Green channel
-    colors[:, 2] = 1.0 - z_norm  # Blue channel
 
-    scatter = scene.visuals.Markers(parent=view.scene, antialias=False)
-    scatter.set_data(points, edge_color=None, face_color=colors, size=5)
+def load_kitti_points(path: str):
+    """Load a KITTI binary point cloud into (N,3) points and intensities."""
+    raw = np.fromfile(path, dtype=np.float32)
+    if raw.size % 4 != 0:
+        raise ValueError(f"File {path} does not look like KITTI format.")
+    raw = raw.reshape(-1, 4)
+    return raw[:, :3], raw[:, 3]
 
-    # 4. Add Axes for reference
-    scene.visuals.XYZAxis(parent=view.scene)
 
-    tensor_pts = torch.from_numpy(points).cuda().contiguous()
+def normalize(values: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
+    return np.clip((values - vmin) / (vmax - vmin), 0.0, 1.0)
 
-    # Auto-compute coors_range from data to ensure we see something
-    min_xyz = points.min(axis=0)
-    max_xyz = points.max(axis=0)
-    # Add a bit of padding
-    coors_range = [
-        min_xyz[0],
-        min_xyz[1],
-        min_xyz[2],
-        max_xyz[0],
-        max_xyz[1],
-        max_xyz[2],
-    ]
 
-    voxel_size = [0.2, 0.2, max_xyz[2] - min_xyz[2]]
-    # voxel_size = [0.2, 0.2, 0.2]
+def jet_colors(norm: np.ndarray) -> np.ndarray:
+    norm = np.clip(norm, 0.0, 1.0)
+    r = np.clip(1.5 - np.abs(4 * norm - 3), 0.0, 1.0)
+    g = np.clip(1.5 - np.abs(4 * norm - 2), 0.0, 1.0)
+    b = np.clip(1.5 - np.abs(4 * norm - 1), 0.0, 1.0)
+    return np.stack([r, g, b], axis=-1).astype(np.float32)
 
-    print(f"Using computed coors_range: {coors_range}")
 
-    # Set max_voxels to number of points to avoid buffer overflow
-    max_voxels = tensor_pts.shape[0]
+def colorize(values: np.ndarray, vmin: float, vmax: float, alpha: float = 1.0):
+    norm = normalize(values, vmin, vmax)
+    colors = np.ones((len(values), 4), dtype=np.float32)
+    colors[:, :3] = jet_colors(norm)
+    colors[:, 3] = alpha
+    return colors
 
-    torch.cuda.synchronize()
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    start_event.record()
 
-    voxel_coors, point_voxel_idx = dynamic_voxelize_gpu(
-        tensor_pts, voxel_size, coors_range
+def voxelize(points: np.ndarray, feats: np.ndarray, voxel_size=None):
+    z_span = max(float(np.ptp(points[:, 2])), 1e-3)
+    voxel_size = voxel_size or [0.2, 0.2, 0.2]
+    # voxel_size = voxel_size or [0.2, 0.2, z_span]
+    min_xyz, max_xyz = points.min(axis=0), points.max(axis=0)
+    coors_range = [*min_xyz, *max_xyz]
+
+    pts_gpu = torch.from_numpy(points).cuda().contiguous()
+
+    voxel_coors, point_voxel_idx, _ = dynamic_voxelize_gpu(
+        pts_gpu, voxel_size, coors_range
     )
 
-    end_event.record()
-    torch.cuda.synchronize()
-    elapsed_time_ms = start_event.elapsed_time(end_event)
-    print(f"Voxelization completed in {elapsed_time_ms:.3f} ms.")
+    valid = point_voxel_idx >= 0
+    if valid.sum() == 0:
+        return None
 
-    # Filter invalid voxels and get unique ones
-    # valid_mask is True where NO coordinate is -1
-    valid_mask = ~(voxel_coors == -1).any(dim=1)
+    uniq = torch.unique(voxel_coors[valid], dim=0)
+    voxel_size_t = torch.tensor(voxel_size, device=pts_gpu.device)
+    offsets = torch.tensor(coors_range[:3], device=pts_gpu.device)
+    centers = uniq.float() * voxel_size_t + offsets + voxel_size_t / 2.0
 
-    print(f"Valid voxels: {valid_mask.sum().item()} / {len(voxel_coors)}")
-    if valid_mask.sum() == 0:
-        print("Warning: No valid voxels found!")
+    ids = point_voxel_idx[valid].cpu().numpy()
+    feats_valid = feats[valid.cpu().numpy()]
+    points_valid = points[valid.cpu().numpy()]
 
-    unique_voxel_coors = torch.unique(voxel_coors[valid_mask], dim=0)
+    d2 = np.linalg.norm(points_valid, axis=-1)
 
-    num_voxels = unique_voxel_coors.shape[0]
+    voxel_max = np.zeros(len(uniq), dtype=np.float32)
+    np.maximum.at(voxel_max, ids, d2)
 
-    # show voxel_coors voxels
-    print(f"Number of unique voxels: {num_voxels}")
+    return centers.cpu().numpy(), voxel_max, voxel_size
 
-    # --- Compute Max Intensity per Voxel ---
-    # 1. Get valid CPU data
-    valid_mask_cpu = valid_mask.cpu().numpy()
-    # point_voxel_idx contains indices into the unique set of voxels [0, num_voxels-1]
-    point_voxel_ids_cpu = point_voxel_idx[valid_mask].cpu().numpy()
-    valid_intensities = intensities[valid_mask_cpu]
 
-    voxel_max_intensities = np.zeros(num_voxels, dtype=np.float32)
-    voxel_densities = np.zeros(num_voxels, dtype=np.int32)
-    # Aggregate max intensity
-    np.maximum.at(voxel_max_intensities, point_voxel_ids_cpu, valid_intensities)
-    np.add.at(voxel_densities, point_voxel_ids_cpu, 1)
-    print(f"Computed max intensities for {num_voxels} voxels.")
+def add_voxels(parent, centers_np, intensities, voxel_size, vmax_for_colors=None):
+    n = len(centers_np)
+    if n == 0:
+        print("No voxels to visualize.")
+        return
 
-    # Show voxels as markers
-    # Markers are much faster than creating individual Box objects
+    sx, sy, sz = voxel_size
+    v_base = np.array(
+        [
+            [-0.5, -0.5, -0.5],
+            [0.5, -0.5, -0.5],
+            [0.5, 0.5, -0.5],
+            [-0.5, 0.5, -0.5],
+            [-0.5, -0.5, 0.5],
+            [0.5, -0.5, 0.5],
+            [0.5, 0.5, 0.5],
+            [-0.5, 0.5, 0.5],
+        ],
+        dtype=np.float32,
+    ) * np.array([sx, sy, sz], dtype=np.float32)
 
-    # No need to downsample for Markers (can handle millions of points)
-
-    # Calculate voxel centers for all unique voxels
-    voxel_size_t = torch.tensor(voxel_size, device=tensor_pts.device)
-    coors_offset = torch.tensor(coors_range[0:3], device=tensor_pts.device)
-
-    # Convert integer coords to world centers
-    voxel_centers = (
-        unique_voxel_coors.float() * voxel_size_t + coors_offset + voxel_size_t / 2.0
+    f_base = np.array(
+        [
+            [0, 1, 2],
+            [0, 2, 3],
+            [0, 1, 5],
+            [0, 5, 4],
+            [1, 2, 6],
+            [1, 6, 5],
+            [2, 3, 7],
+            [2, 7, 6],
+            [3, 0, 4],
+            [3, 4, 7],
+            [4, 5, 6],
+            [4, 6, 7],
+        ],
+        dtype=np.uint32,
     )
 
-    # Move to CPU for Vispy
-    voxel_centers_np = voxel_centers.cpu().numpy()
+    offsets = (np.arange(n, dtype=np.uint32) * 8)[:, None, None]
+    vertices = (centers_np[:, None, :] + v_base[None, :, :]).reshape(-1, 3)
+    faces = (f_base[None, :, :] + offsets).reshape(-1, 3)
 
-    n_voxels = len(voxel_centers_np)
-    print(f"Visualizing {n_voxels} voxels as mesh cubes.")
+    voxel_dist = np.linalg.norm(centers_np, axis=-1) ** 0.5
+    vmax = voxel_dist.max() if vmax_for_colors is None else vmax_for_colors
+    v_colors = colorize(voxel_dist, vmin=0.0, vmax=vmax, alpha=0.2)
+    vertex_colors = np.repeat(v_colors, 8, axis=0)
 
-    if n_voxels > 0:
-        # Generate Cube Mesh Data
-        sx, sy, sz = voxel_size[0], voxel_size[1], voxel_size[2]
+    visuals.Mesh(  # type: ignore[attr-defined]
+        vertices=vertices, faces=faces, vertex_colors=vertex_colors, parent=parent
+    )
 
-        # Base cube vertices (centered at 0)
-        v_base = np.array(
-            [
-                [-0.5, -0.5, -0.5],
-                [0.5, -0.5, -0.5],
-                [0.5, 0.5, -0.5],
-                [-0.5, 0.5, -0.5],
-                [-0.5, -0.5, 0.5],
-                [0.5, -0.5, 0.5],
-                [0.5, 0.5, 0.5],
-                [-0.5, 0.5, 0.5],
-            ],
-            dtype=np.float32,
-        ) * np.array([sx, sy, sz], dtype=np.float32)
+    e_base = np.array(
+        [
+            [0, 1],
+            [1, 2],
+            [2, 3],
+            [3, 0],
+            [4, 5],
+            [5, 6],
+            [6, 7],
+            [7, 4],
+            [0, 4],
+            [1, 5],
+            [2, 6],
+            [3, 7],
+        ],
+        dtype=np.uint32,
+    )
+    edges = (e_base[None, :, :] + offsets).reshape(-1, 2)
+    visuals.Line(  # type: ignore[attr-defined]
+        pos=vertices,
+        connect=edges,
+        color=(0, 0, 0, 1),
+        width=2,
+        antialias=True,
+        parent=parent,
+    )
 
-        # Base cube faces (indices)
-        f_base = np.array(
-            [
-                [0, 1, 2],
-                [0, 2, 3],  # Bottom
-                [0, 1, 5],
-                [0, 5, 4],  # Front
-                [1, 2, 6],
-                [1, 6, 5],  # Right
-                [2, 3, 7],
-                [2, 7, 6],  # Back
-                [3, 0, 4],
-                [3, 4, 7],  # Left
-                [4, 5, 6],
-                [4, 6, 7],  # Top
-            ],
-            dtype=np.uint32,
-        )
 
-        # Expand to all voxels (Broadcasting)
-        # Vertices: (N, 8, 3) -> Reshape (N*8, 3)
-        vertices = (
-            voxel_centers_np[:, np.newaxis, :] + v_base[np.newaxis, :, :]
-        ).reshape(-1, 3)
+def clear_scene(container):
+    for child in list(container.children):
+        child.parent = None
 
-        # Faces: (N, 12, 3) -> Reshape (N*12, 3)
-        # Add offset to indices: 0 for first voxel, 8 for second, etc.
-        offsets = np.arange(n_voxels, dtype=np.uint32) * 8
-        faces = (f_base[np.newaxis, :, :] + offsets[:, np.newaxis, np.newaxis]).reshape(
-            -1, 3
-        )
 
-        # --- Color voxels by Max Intensity (Same color space as points) ---
-        # Normalize Intensity [0, 1] (Assuming KITTI intensity is 0-1)
-        # If intensity > 1, clip.
-        # v_int = np.clip(voxel_max_intensities, 0, 1)  # Norm factor
-        v_int = (voxel_densities / voxel_densities.max()) ** (0.3)  # Density normalized
+def render_frame(container, bin_path: Path, canvas):
+    clear_scene(container)
 
-        # Use same colormap logic as points (Red->Blueish)
-        # Point logic for Z was: [z_norm, z_norm*0.5, 1-z_norm]
-        # We reuse this logic but with intensity
+    points, feats = load_kitti_points(str(bin_path))
+    print(f"Loaded {len(points)} points from {bin_path.name}")
 
-        v_colors = np.zeros((n_voxels, 4), dtype=np.float32)
-        v_colors[:, 0] = v_int  # Red
-        v_colors[:, 1] = v_int * 0.5  # Green
-        v_colors[:, 2] = 1.0 - v_int  # Blue
-        v_colors[:, 3] = 0.4  # Alpha
+    visuals.XYZAxis(parent=container)  # type: ignore[attr-defined]
 
-        # Expand to vertices (8 per voxel)
-        vertex_colors = np.repeat(v_colors, 8, axis=0)
+    points_norm = np.linalg.norm(points, axis=-1) ** 0.5
+    scatter_max = points_norm.max()
+    scatter_colors = colorize(points_norm, vmin=0, vmax=scatter_max)
+    visuals.Markers(parent=container, antialias=False).set_data(  # type: ignore[attr-defined]
+        points, edge_color=None, face_color=scatter_colors, size=5
+    )
 
-        # Create Mesh
-        # Using flat shading or just solid color. edge_color makes individual voxels distinct.
-        voxel_mesh = scene.visuals.Mesh(
-            vertices=vertices,
-            faces=faces,
-            vertex_colors=vertex_colors,
-            parent=view.scene,
-        )
-
-        # Create Wireframe (Edges) for the cubes
-        # Define the 12 edges of a cube (indices into 0-7 vertices)
-        e_base = np.array(
-            [
-                [0, 1],
-                [1, 2],
-                [2, 3],
-                [3, 0],  # Bottom
-                [4, 5],
-                [5, 6],
-                [6, 7],
-                [7, 4],  # Top
-                [0, 4],
-                [1, 5],
-                [2, 6],
-                [3, 7],  # Pillars
-            ],
-            dtype=np.uint32,
-        )  # Shape (12, 2)
-
-        # Expand edges indices for all voxels
-        # Shape (N, 12, 2) + offsets -> (N*12, 2)
-        edges_connect = (
-            e_base[np.newaxis, :, :] + offsets[:, np.newaxis, np.newaxis]
-        ).reshape(-1, 2)
-
-        # Create Line Visual
-        # We reuse the same 'vertices' array as the positions.
-        voxel_wireframe = scene.visuals.Line(
-            pos=vertices,
-            connect=edges_connect,
-            color=(0.0, 0, 0, 1),  # Dark red/blackish
-            width=3,
-            antialias=True,
-            parent=view.scene,
+    voxels = voxelize(points, feats)
+    if voxels:
+        centers_np, densities, voxel_size = voxels
+        print(f"Rendering {len(centers_np)} voxels.")
+        add_voxels(
+            container, centers_np, densities, voxel_size, vmax_for_colors=scatter_max
         )
     else:
         print("No voxels to visualize.")
 
-    # 5. Run Application
-    print("Running visualization. Press 'Interaction' keys to move camera.")
+    if canvas is not None:
+        canvas.update()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Visualize KITTI .bin point clouds in a folder"
+    )
+    parser.add_argument(
+        "path",
+        nargs="?",
+        default=".",
+        help="Folder containing .bin files (default: current dir)",
+    )
+    args = parser.parse_args()
+
+    folder = Path(args.path)
+    files = sorted(folder.glob("*.bin"))
+    if not files:
+        print(f"No .bin files found in {folder}")
+        sys.exit(1)
+
+    canvas = scene.SceneCanvas(
+        keys="interactive", show=True, title="Point Cloud + Voxels"
+    )
+    view = canvas.central_widget.add_view()
+    view.camera = "turntable"
+    content = scene.Node(parent=view.scene)
+
+    state = {"idx": 0}
+
+    def show_current():
+        print("\n" + "-" * 40)
+        print(f"Showing {state['idx'] + 1}/{len(files)}: {files[state['idx']].name}")
+        render_frame(content, files[state["idx"]], canvas)
+
+    def on_key(event):
+        key_obj = event.key
+        key_name = getattr(key_obj, "name", str(key_obj)).upper()
+        if key_name in ("RIGHT", "N", "SPACE", "RETURN", "ENTER"):
+            state["idx"] = (state["idx"] + 1) % len(files)
+            show_current()
+        elif key_name in ("LEFT", "B"):
+            state["idx"] = (state["idx"] - 1) % len(files)
+            show_current()
+
+    canvas.events.key_press.connect(on_key)  # type: ignore[attr-defined]
+
+    show_current()
+    print("Keys: Right/N/Space/Enter = next, Left/B = previous. Close window to quit.")
     app.run()
 
 
