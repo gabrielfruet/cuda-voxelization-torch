@@ -2,6 +2,8 @@
 
 Minimal playground for GPU voxelization of KITTI point clouds and quick 3D visualization.
 
+![](./assets/cuda-voxelization-vis.png)
+
 ## Prereqs
 - Python 3.10+
 - CUDA-capable GPU + CUDA drivers
